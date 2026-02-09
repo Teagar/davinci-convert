@@ -1,0 +1,166 @@
+#!/bin/bash
+
+VERSION="1.0.0"
+
+RED="\033[1;31m"
+GREEN="\033[1;32m"
+BLUE="\033[1;34m"
+NC="\033[0m"
+
+INPUT=""
+OUTPUT=""
+BATCH=""
+DNX_MODE="dnxhd"
+DNXHR_PROFILE="sq"
+FPS=""
+NO_AUDIO=0
+
+# ---------- Help ----------
+print_help() {
+cat << EOF
+davinci-convert v$VERSION
+
+USAGE:
+  davinci-convert input.mp4
+  davinci-convert -i input.mp4
+  davinci-convert input.mp4 -o output.mov
+  davinci-convert -b folder/
+
+OPTIONS:
+  -i <file>        Input file
+  -o <file>        Output file
+  -b <folder>      Batch folder
+  --dnxhd          Use DNxHD (default)
+  --dnxhr <mode>   lb, sq, hq, hqx, 444
+  --fps <value>    Force FPS
+  --no-audio       Remove audio
+  -h, --help       Help
+  -v, --version    Version
+EOF
+}
+
+# ---------- Args ----------
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -i) INPUT="$2"; shift 2 ;;
+        -o) OUTPUT="$2"; shift 2 ;;
+        -b) BATCH="$2"; shift 2 ;;
+        --dnxhd) DNX_MODE="dnxhd"; shift ;;
+        --dnxhr)
+            DNX_MODE="dnxhr"
+            DNXHR_PROFILE="$2"
+            shift 2
+        ;;
+        --fps) FPS="$2"; shift 2 ;;
+        --no-audio) NO_AUDIO=1; shift ;;
+        -h|--help) print_help; exit 0 ;;
+        -v|--version) echo "davinci-convert v$VERSION"; exit 0 ;;
+        *)
+            if [[ -z "$INPUT" ]]; then
+                INPUT="$1"
+                shift
+            else
+                echo -e "${RED}Invalid argument:${NC} $1"
+                exit 1
+            fi
+        ;;
+    esac
+done
+
+# ---------- No args = help ----------
+if [[ -z "$INPUT" && -z "$BATCH" ]]; then
+    print_help
+    exit 0
+fi
+
+# ---------- Convert ----------
+convert_file() {
+    FILE="$1"
+    BASENAME="$(basename "$FILE")"
+    NAME="${BASENAME%.*}"
+
+    if [[ -n "$OUTPUT" && -z "$BATCH" ]]; then
+        OUT="$OUTPUT"
+    else
+        OUT="${NAME}_davinci.mov"
+    fi
+
+    [[ ! -f "$FILE" ]] && { echo "File not found: $FILE"; return; }
+
+    DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$FILE")
+    DURATION=${DURATION%.*}
+    [[ -z "$DURATION" || "$DURATION" -eq 0 ]] && DURATION=1
+
+    echo -e "${BLUE}Input:${NC}  $FILE"
+    echo -e "${BLUE}Output:${NC} $OUT"
+
+    if [[ "$DNX_MODE" == "dnxhr" ]]; then
+        VOPTS="-c:v dnxhd -profile:v dnxhr_${DNXHR_PROFILE}"
+    else
+        VOPTS="-c:v dnxhd -b:v 36M"
+    fi
+
+    [[ -n "$FPS" ]] && FPS_OPT="-r $FPS" || FPS_OPT=""
+
+    if [[ "$NO_AUDIO" -eq 1 ]]; then
+        AOPTS="-an"
+    else
+        AOPTS="-c:a pcm_s16le -ar 48000 -ac 2"
+    fi
+
+    BAR_WIDTH=40
+    START_TIME=$(date +%s)
+
+    ffmpeg -y -i "$FILE" \
+        $VOPTS -pix_fmt yuv422p $FPS_OPT \
+        $AOPTS \
+        -progress pipe:1 -nostats \
+        "$OUT" 2>&1 | while read -r line; do
+            case "$line" in
+                out_time_ms=*)
+                    MS=${line#out_time_ms=}
+                    SECONDS=$(awk "BEGIN { printf \"%.0f\", $MS/1000000 }")
+                    PERCENT=$(awk "BEGIN { printf \"%d\", ($SECONDS/$DURATION)*100 }")
+                    ((PERCENT>100)) && PERCENT=100
+
+                    FILLED=$((PERCENT * BAR_WIDTH / 100))
+                    EMPTY=$((BAR_WIDTH - FILLED))
+
+
+                    NOW=$(date +%s)
+                    ELAPSED=$((NOW - START_TIME))
+
+                    if (( PERCENT > 0 )); then
+                        ETA=$(( (ELAPSED * (100 - PERCENT)) / PERCENT ))
+                    else
+                        ETA=0
+                    fi
+
+                    ETA_FMT=$(printf "%02d:%02d:%02d" $((ETA/3600)) $((ETA%3600/60)) $((ETA%60)))
+                    ELAPSED_FMT=$(printf "%02d:%02d:%02d" $((ELAPSED/3600)) $((ELAPSED%3600/60)) $((ELAPSED%60)))
+
+                    printf "\r\033[KProgress: ["
+                    printf "%0.s=" $(seq 1 $FILLED)
+                    printf "%0.s " $(seq 1 $EMPTY)
+                    printf "] %3d%% ${BLUE}ETA ${NC}%s ${BLUE}Elapsed ${NC}%s" "$PERCENT" "$ETA_FMT" "$ELAPSED_FMT"
+                ;;
+            esac
+        done
+
+    echo
+    echo -e "${GREEN}Done:${NC} $OUT"
+    echo
+}
+
+# ---------- Logic ----------
+if [[ -n "$BATCH" ]]; then
+    [[ ! -d "$BATCH" ]] && { echo "Folder not found"; exit 1; }
+    for f in "$BATCH"/*; do
+        [[ -f "$f" ]] && convert_file "$f"
+    done
+    exit 0
+fi
+
+[[ -z "$INPUT" ]] && { echo -e "${RED}No input file.${NC}"; exit 1; }
+
+convert_file "$INPUT"
